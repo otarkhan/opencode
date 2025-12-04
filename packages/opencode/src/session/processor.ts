@@ -11,6 +11,7 @@ import { Bus } from "@/bus"
 import { SessionRetry } from "./retry"
 import { SessionStatus } from "./status"
 import type { Provider } from "@/provider/provider"
+import { ToolFormats } from "@/provider/tool-format"
 
 export namespace SessionProcessor {
   const DOOM_LOOP_THRESHOLD = 3
@@ -28,6 +29,14 @@ export namespace SessionProcessor {
     }
   }
 
+  /** Tool call parsed from non-native format (e.g., XML in text) awaiting execution */
+  export interface PendingToolCall {
+    id: string
+    name: string
+    parameters: Record<string, unknown>
+    part: MessageV2.ToolPart
+  }
+
   export function create(input: {
     assistantMessage: MessageV2.Assistant
     sessionID: string
@@ -35,6 +44,7 @@ export namespace SessionProcessor {
     abort: AbortSignal
   }) {
     const toolcalls: Record<string, MessageV2.ToolPart> = {}
+    const pendingToolCalls: PendingToolCall[] = []
     let snapshot: string | undefined
     let blocked = false
     let attempt = 0
@@ -45,6 +55,12 @@ export namespace SessionProcessor {
       },
       partFromToolCall(toolCallID: string) {
         return toolcalls[toolCallID]
+      },
+      getPendingToolCalls() {
+        return pendingToolCalls
+      },
+      clearPendingToolCalls() {
+        pendingToolCalls.length = 0
       },
       async process(streamInput: StreamInput) {
         log.info("process")
@@ -253,12 +269,16 @@ export namespace SessionProcessor {
                     usage: value.usage,
                     metadata: value.providerMetadata,
                   })
-                  input.assistantMessage.finish = value.finishReason
+                  // Don't overwrite finish reason if we detected pending tool calls
+                  // (we set it to "tool-calls" in text-end to prevent the loop from exiting)
+                  if (pendingToolCalls.length === 0) {
+                    input.assistantMessage.finish = value.finishReason
+                  }
                   input.assistantMessage.cost += usage.cost
                   input.assistantMessage.tokens = usage.tokens
                   await Session.updatePart({
                     id: Identifier.ascending("part"),
-                    reason: value.finishReason,
+                    reason: pendingToolCalls.length > 0 ? "tool-calls" : value.finishReason,
                     snapshot: await Snapshot.track(),
                     messageID: input.assistantMessage.id,
                     sessionID: input.assistantMessage.sessionID,
@@ -315,13 +335,84 @@ export namespace SessionProcessor {
 
                 case "text-end":
                   if (currentText) {
-                    currentText.text = currentText.text.trimEnd()
+                    // Check for non-native tool call formats (e.g., MiniMax XML)
+                    const toolFormat = ToolFormats.get(input.model)
+                    const hasToolCall = toolFormat?.hasToolCall(currentText.text) ?? false
+                    const hasCompleteToolCall = toolFormat?.hasCompleteToolCall(currentText.text) ?? false
+
+                    log.info("text-end", {
+                      toolFormat: toolFormat?.id ?? "native",
+                      hasToolCall,
+                      hasCompleteToolCall,
+                      textLength: currentText.text.length,
+                      textPreview: currentText.text.substring(0, 500),
+                    })
+
+                    if (toolFormat && hasCompleteToolCall) {
+                      const parsed = toolFormat.parse(currentText.text)
+
+                      // Create ToolPart entries for each parsed tool call
+                      for (const toolCall of parsed.toolCalls) {
+                        const toolPart = await Session.updatePart({
+                          id: Identifier.ascending("part"),
+                          messageID: input.assistantMessage.id,
+                          sessionID: input.assistantMessage.sessionID,
+                          type: "tool",
+                          tool: toolCall.name,
+                          callID: toolCall.id,
+                          state: {
+                            status: "pending",
+                            input: toolCall.parameters,
+                            raw: "",
+                          },
+                        }) as MessageV2.ToolPart
+
+                        pendingToolCalls.push({
+                          id: toolCall.id,
+                          name: toolCall.name,
+                          parameters: toolCall.parameters,
+                          part: toolPart,
+                        })
+
+                        toolcalls[toolCall.id] = toolPart
+                      }
+
+                      // Override finish reason to "tool-calls" so the loop knows to continue
+                      // (otherwise it exits because the AI SDK doesn't know about non-native tool calls)
+                      input.assistantMessage.finish = "tool-calls"
+                      // IMPORTANT: Also persist this to storage so the loop sees it when re-fetching messages
+                      await Session.updateMessage(input.assistantMessage)
+
+                      // Update text to remove tool call XML (keep thinking if present)
+                      currentText.text = parsed.cleanedText.trimEnd()
+
+                      // If there's thinking content, create a reasoning part
+                      if (parsed.thinking) {
+                        await Session.updatePart({
+                          id: Identifier.ascending("part"),
+                          messageID: input.assistantMessage.id,
+                          sessionID: input.assistantMessage.sessionID,
+                          type: "reasoning",
+                          text: parsed.thinking,
+                          time: {
+                            start: currentText.time?.start ?? Date.now(),
+                            end: Date.now(),
+                          },
+                        })
+                      }
+                    } else {
+                      currentText.text = currentText.text.trimEnd()
+                    }
+
                     currentText.time = {
-                      start: Date.now(),
+                      start: currentText.time?.start ?? Date.now(),
                       end: Date.now(),
                     }
                     if (value.providerMetadata) currentText.metadata = value.providerMetadata
-                    await Session.updatePart(currentText)
+                    // Only update if there's actual text content after removing XML
+                    if (currentText.text) {
+                      await Session.updatePart(currentText)
+                    }
                   }
                   currentText = undefined
                   break
@@ -380,8 +471,17 @@ export namespace SessionProcessor {
           }
           input.assistantMessage.time.completed = Date.now()
           await Session.updateMessage(input.assistantMessage)
-          if (blocked) return "stop"
-          if (input.assistantMessage.error) return "stop"
+
+          if (blocked) {
+            return "stop"
+          }
+          if (input.assistantMessage.error) {
+            return "stop"
+          }
+          // Check if there are pending tool calls (from non-native formats) that need execution
+          if (pendingToolCalls.length > 0) {
+            return "pending_tools"
+          }
           return "continue"
         }
       },

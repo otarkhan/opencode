@@ -9,6 +9,8 @@ export namespace ModelsDev {
   const log = Log.create({ service: "models.dev" })
   const filepath = path.join(Global.Path.cache, "models.json")
 
+  export const ToolCallFormat = z.enum(["native", "minimax"]).describe("Tool call format: 'native' for standard API tool calls, 'minimax' for MiniMax-M2 XML format")
+
   export const Model = z.object({
     id: z.string(),
     name: z.string(),
@@ -17,6 +19,7 @@ export namespace ModelsDev {
     reasoning: z.boolean(),
     temperature: z.boolean(),
     tool_call: z.boolean(),
+    tool_call_format: ToolCallFormat.optional(),
     cost: z
       .object({
         input: z.number(),

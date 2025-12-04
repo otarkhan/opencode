@@ -313,6 +313,7 @@ export namespace Provider {
         reasoning: z.boolean(),
         attachment: z.boolean(),
         toolcall: z.boolean(),
+        toolCallFormat: z.enum(["native", "minimax"]).optional(),
         input: z.object({
           text: z.boolean(),
           audio: z.boolean(),
@@ -414,6 +415,7 @@ export namespace Provider {
         reasoning: model.reasoning,
         attachment: model.attachment,
         toolcall: model.tool_call,
+        toolCallFormat: model.tool_call_format ?? "native",
         input: {
           text: model.modalities?.input?.includes("text") ?? false,
           audio: model.modalities?.input?.includes("audio") ?? false,
@@ -525,6 +527,7 @@ export namespace Provider {
             reasoning: model.reasoning ?? existing?.capabilities.reasoning ?? false,
             attachment: model.attachment ?? existing?.capabilities.attachment ?? false,
             toolcall: model.tool_call ?? existing?.capabilities.toolcall ?? true,
+            toolCallFormat: model.tool_call_format ?? existing?.capabilities.toolCallFormat ?? "native",
             input: {
               text: model.modalities?.input?.includes("text") ?? existing?.capabilities.input.text ?? true,
               audio: model.modalities?.input?.includes("audio") ?? existing?.capabilities.input.audio ?? false,

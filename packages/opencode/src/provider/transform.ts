@@ -2,6 +2,7 @@ import type { APICallError, ModelMessage } from "ai"
 import { unique } from "remeda"
 import type { JSONSchema } from "zod/v4/core"
 import type { Provider } from "./provider"
+import { ToolFormats, type ToolFormat } from "./tool-format"
 
 export namespace ProviderTransform {
   function normalizeMessages(msgs: ModelMessage[], model: Provider.Model): ModelMessage[] {
@@ -154,7 +155,75 @@ export namespace ProviderTransform {
       msgs = applyCaching(msgs, model.providerID)
     }
 
+    // For models with non-native tool call formats, convert tool results to text
+    const toolFormat = ToolFormats.get(model)
+    if (toolFormat) {
+      msgs = convertToolResultsToText(msgs, toolFormat)
+    }
+
     return msgs
+  }
+
+  /**
+   * Convert tool-call and tool-result parts to text format for models that don't support native tool calls.
+   * This is used for models that use non-native tool calling formats (e.g., XML embedded in text).
+   */
+  function convertToolResultsToText(msgs: ModelMessage[], toolFormat: ToolFormat): ModelMessage[] {
+    const result: ModelMessage[] = []
+
+    for (const msg of msgs) {
+      if (msg.role === "tool" && Array.isArray(msg.content)) {
+        // Convert tool result message to user message with text
+        const textParts: { type: "text"; text: string }[] = []
+        for (const part of msg.content) {
+          if (part.type === "tool-result") {
+            // Convert the typed output union to a string
+            const output = part.output
+            let outputText: string
+            if (output.type === "text" || output.type === "error-text") {
+              outputText = output.value
+            } else if (output.type === "json" || output.type === "error-json") {
+              outputText = JSON.stringify(output.value, null, 2)
+            } else if (output.type === "content") {
+              // Handle content array - extract text parts
+              outputText = output.value
+                .filter((item): item is { type: "text"; text: string } => item.type === "text")
+                .map((item) => item.text)
+                .join("\n")
+            } else {
+              outputText = JSON.stringify(output, null, 2)
+            }
+            // Use the tool format to format the result
+            textParts.push({
+              type: "text",
+              text: toolFormat.formatToolResult({
+                toolName: part.toolName,
+                output: outputText,
+              }),
+            })
+          }
+        }
+        if (textParts.length > 0) {
+          result.push({
+            role: "user",
+            content: textParts,
+          })
+        }
+      } else if (msg.role === "assistant" && Array.isArray(msg.content)) {
+        // Filter out tool-call parts from assistant messages (they're already in the text as XML)
+        const filteredContent = msg.content.filter((part) => part.type !== "tool-call")
+        if (filteredContent.length > 0) {
+          result.push({
+            ...msg,
+            content: filteredContent,
+          })
+        }
+      } else {
+        result.push(msg)
+      }
+    }
+
+    return result
   }
 
   export function temperature(model: Provider.Model) {

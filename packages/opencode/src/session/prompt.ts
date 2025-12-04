@@ -267,6 +267,7 @@ export namespace SessionPrompt {
       }
 
       if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
+
       if (
         lastAssistant?.finish &&
         !["tool-calls", "unknown"].includes(lastAssistant.finish) &&
@@ -615,6 +616,108 @@ export namespace SessionPrompt {
         }),
       })
       if (result === "stop") break
+      // Handle tool calls from non-native formats (e.g., XML embedded in text)
+      if (result === "pending_tools") {
+        const pendingCalls = processor.getPendingToolCalls()
+        const toolDefs = await ToolRegistry.tools(model.providerID)
+        const toolMap = new Map(toolDefs.map((t) => [t.id, t]))
+
+        for (const call of pendingCalls) {
+          const toolDef = toolMap.get(call.name)
+          if (!toolDef) {
+            // Tool not found - mark as error
+            await Session.updatePart({
+              ...call.part,
+              state: {
+                status: "error",
+                input: call.parameters,
+                error: `Tool "${call.name}" not found`,
+                time: {
+                  start: Date.now(),
+                  end: Date.now(),
+                },
+              },
+            })
+            continue
+          }
+
+          // Update to running state
+          await Session.updatePart({
+            ...call.part,
+            state: {
+              status: "running",
+              input: call.parameters,
+              time: {
+                start: Date.now(),
+              },
+            },
+          })
+
+          try {
+            // Execute the tool
+            const toolResult = await toolDef.execute(call.parameters, {
+              sessionID,
+              abort,
+              messageID: processor.message.id,
+              callID: call.id,
+              extra: { model },
+              agent: agent.name,
+              metadata: async (val) => {
+                const match = processor.partFromToolCall(call.id)
+                if (match && match.state.status === "running") {
+                  await Session.updatePart({
+                    ...match,
+                    state: {
+                      title: val.title,
+                      metadata: val.metadata,
+                      status: "running",
+                      input: call.parameters,
+                      time: {
+                        start: Date.now(),
+                      },
+                    },
+                  })
+                }
+              },
+            })
+
+            // Update to completed state
+            await Session.updatePart({
+              ...call.part,
+              state: {
+                status: "completed",
+                input: call.parameters,
+                title: toolResult.title,
+                metadata: toolResult.metadata,
+                output: toolResult.output,
+                attachments: toolResult.attachments,
+                time: {
+                  start: call.part.state.status === "running" ? call.part.state.time.start : Date.now(),
+                  end: Date.now(),
+                },
+              },
+            } satisfies MessageV2.ToolPart)
+          } catch (e: any) {
+            // Update to error state
+            await Session.updatePart({
+              ...call.part,
+              state: {
+                status: "error",
+                input: call.parameters,
+                error: e.message ?? "Tool execution failed",
+                time: {
+                  start: call.part.state.status === "running" ? call.part.state.time.start : Date.now(),
+                  end: Date.now(),
+                },
+              },
+            } satisfies MessageV2.ToolPart)
+          }
+        }
+
+        processor.clearPendingToolCalls()
+        // Continue to let the model see the tool results
+        continue
+      }
       continue
     }
     SessionCompaction.prune({ sessionID })
